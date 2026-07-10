@@ -492,8 +492,8 @@ def parse_mutation_profile(sequence: str) -> list[str]:
 # ===========================================================================
 # 2. PEMUATAN ARTEFAK — PATH DIPERBAIKI DENGAN os.path.join()
 # ===========================================================================
-SAVE_DIR   = "."
-BILSTM_DIR = "."
+SAVE_DIR   = os.path.dirname(os.path.abspath(__file__))
+BILSTM_DIR = SAVE_DIR
 
 
 @st.cache_resource(show_spinner=False)
