@@ -703,6 +703,10 @@ def render_shap_summary(model, X_train_xgb):
 
     elapsed = time.time() - t0
     logger.info(f"SHAP selesai dalam {elapsed:.3f}s. Top fitur: {top_features}")
+    # ✅ FIX: Lepaskan figure dari registry global pyplot agar tidak menumpuk di
+    # memori pada sesi yang panjang (setiap klik tombol membuat figure baru).
+    # fig tetap valid untuk dipakai di st.pyplot() setelah di-close.
+    plt.close(fig)
     return fig, top_features
 
 
@@ -745,6 +749,8 @@ def render_probability_gauge(probability, threshold):
     ax.axis('off')
     ax.set_facecolor('#FFFFFF')
     plt.tight_layout()
+    # ✅ FIX: sama seperti render_shap_summary — cegah penumpukan figure di memori.
+    plt.close(fig)
     return fig
 
 
@@ -1010,22 +1016,33 @@ with tab_analysis:
             X_xgb, X_lstm = extract_features(seq_clean, tokenizer, max_len, xgb_model)
             t_total_start = time.time()
 
-            with st.spinner("Memproses komputasi Klasifikasi, Regresi, dan atribusi SHAP secara simultan..."):
+            with st.spinner("Memproses komputasi Klasifikasi, Regresi, dan atribusi SHAP..."):
+                X_train_exp = artifacts['all_ready_data'][drug_choice]['X_train_xgb']
+
+                # ✅ FIX (root cause segfault): render_shap_summary() memanggil API
+                # pyplot global (plt.subplots/plt.title/plt.tight_layout) yang menurut
+                # dokumentasi resmi Matplotlib TIDAK thread-safe. Menjalankannya di
+                # worker thread ThreadPoolExecutor secara bersamaan dengan
+                # tf.keras Model.predict() (juga bukan thread-safe secara resmi —
+                # lih. tensorflow/tensorflow#61298) di thread lain memicu race
+                # condition di level C/C++ yang berujung Segmentation Fault.
+                # Segfault adalah crash di level OS (SIGSEGV), BUKAN exception Python,
+                # sehingga tidak bisa dicegah dengan try/except atau guard NaN apa pun.
+                # Solusi: SHAP/Matplotlib SELALU dijalankan sekuensial di main thread.
+                # XGBoost & Bi-LSTM tetap boleh paralel karena keduanya operasi numerik
+                # murni yang tidak menyentuh state global pyplot.
                 if run_mode == "Simultan (Paralel)" and bilstm_model is not None:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                         future_class = executor.submit(run_xgb_classification, xgb_model, X_xgb, threshold)
                         future_reg   = executor.submit(run_bilstm_regression, bilstm_model, X_lstm, drug_choice)
-                        X_train_exp  = artifacts['all_ready_data'][drug_choice]['X_train_xgb']
-                        future_shap  = executor.submit(render_shap_summary, xgb_model, X_train_exp)
                         class_result = future_class.result()
                         reg_result   = future_reg.result()
-                        shap_result  = future_shap.result()
                 else:
                     class_result = run_xgb_classification(xgb_model, X_xgb, threshold)
                     reg_result   = run_bilstm_regression(bilstm_model, X_lstm, drug_choice) if bilstm_model else None
-                    X_train_exp  = artifacts['all_ready_data'][drug_choice]['X_train_xgb']
-                    shap_result  = render_shap_summary(xgb_model, X_train_exp)
 
+                # SHAP/Matplotlib: SELALU sekuensial di main thread, di luar executor.
+                shap_result = render_shap_summary(xgb_model, X_train_exp)
                 shap_fig, top_features = shap_result
                 total_elapsed = (time.time() - t_total_start) * 1000
 
