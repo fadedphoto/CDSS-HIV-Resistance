@@ -7,6 +7,13 @@ Kerangka: CRISP-MED-DM | Standar: IUPAC Amino Acid Notation
 ===========================================================================
 """
 
+import os
+# ✅ FIX: Nonaktifkan optimisasi oneDNN SEBELUM TensorFlow di-import.
+# oneDNN dapat mengubah urutan komputasi floating-point tergantung hardware CPU,
+# yang berpotensi menyebabkan instabilitas numerik (NaN) pada inferensi Bi-LSTM
+# di lingkungan cloud yang berbeda dari lingkungan lokal tempat model dilatih.
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -20,7 +27,6 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import concurrent.futures
 import time
-import os
 import logging
 from datetime import datetime
 from tensorflow.keras.preprocessing.sequence import pad_sequences
@@ -492,7 +498,7 @@ def parse_mutation_profile(sequence: str) -> list[str]:
 # ===========================================================================
 # 2. PEMUATAN ARTEFAK — PATH DIPERBAIKI DENGAN os.path.join()
 # ===========================================================================
-SAVE_DIR = os.path.dirname(os.path.abspath(__file__))
+SAVE_DIR   = os.path.dirname(os.path.abspath(__file__))
 BILSTM_DIR = SAVE_DIR
 
 
@@ -623,8 +629,24 @@ def run_bilstm_regression(model, X_lstm, drug_name=""):
     t0 = time.time()
     pred_log10 = float(model.predict(X_lstm, verbose=0)[0][0])
     fold_change = 10 ** pred_log10
-
+    elapsed = time.time() - t0
     clinical_cutoff = CLINICAL_CUTOFFS.get(drug_name.upper(), 3.5)
+
+    # ✅ FIX: Tangkap NaN/Inf di sumbernya. Tanpa ini, nilai non-finite akan
+    # diam-diam gagal di SEMUA perbandingan "<" di bawah (NaN selalu False),
+    # sehingga jatuh ke kategori "Resistensi Tinggi" secara keliru.
+    if not np.isfinite(fold_change):
+        logger.error(f"Bi-LSTM [{drug_name}] menghasilkan nilai non-finite (log10={pred_log10}) — prediksi ditolak")
+        return {
+            "fold_change": float("nan"),
+            "log10_value": pred_log10,
+            "severity": "Tidak Valid",
+            "severity_color": "gray",
+            "clinical_cutoff": clinical_cutoff,
+            "elapsed_ms": elapsed * 1000,
+            "is_valid": False
+        }
+
     if fold_change < clinical_cutoff:
         severity = "Rentan"
         severity_color = "green"
@@ -638,7 +660,6 @@ def run_bilstm_regression(model, X_lstm, drug_name=""):
         severity = "Resistensi Tinggi"
         severity_color = "red"
 
-    elapsed = time.time() - t0
     logger.info(f"Bi-LSTM [{drug_name}] FC={fold_change:.2f} ({severity}) dalam {elapsed:.3f}s")
     return {
         "fold_change": fold_change,
@@ -646,7 +667,8 @@ def run_bilstm_regression(model, X_lstm, drug_name=""):
         "severity": severity,
         "severity_color": severity_color,
         "clinical_cutoff": clinical_cutoff,
-        "elapsed_ms": elapsed * 1000
+        "elapsed_ms": elapsed * 1000,
+        "is_valid": True
     }
 
 
@@ -1179,43 +1201,65 @@ with tab_analysis:
 
         # ✅ KONGRUENSI DUAL-PIPELINE: Sintesis integratif antara XGBoost & Bi-LSTM
         if reg_res is not None:
-            xgb_resistant   = class_res["diagnosis"] == "RESISTEN"
-            bilstm_resistant = reg_res["fold_change"] >= reg_res["clinical_cutoff"]
-
-            if xgb_resistant == bilstm_resistant:
-                _status = "KONSISTEN"
-                if xgb_resistant:
-                    _c, _bg, _bd = "#C0392B", "rgba(192,57,43,0.07)", "rgba(192,57,43,0.28)"
-                    _icon = "🔴"
-                    _text = ("XGBoost dan Bi-LSTM <strong>sama-sama mendeteksi resistensi</strong>. "
-                             "Pertimbangkan evaluasi penggantian regimen ARV bersama klinisi.")
-                else:
-                    _c, _bg, _bd = "#1A7A4A", "rgba(26,122,74,0.07)", "rgba(26,122,74,0.28)"
-                    _icon = "🟢"
-                    _text = ("XGBoost dan Bi-LSTM <strong>sama-sama menunjukkan virus masih sensitif</strong>. "
-                             "Terapi ARV yang berjalan saat ini dinilai masih efektif.")
-            else:
-                _status = "TIDAK KONSISTEN"
-                _c, _bg, _bd = "#B7770D", "rgba(183,119,13,0.07)", "rgba(183,119,13,0.35)"
-                _icon = "⚠️"
-                _text = ("Hasil XGBoost dan Bi-LSTM <strong>tidak saling mendukung</strong>. "
-                         "Disarankan pemeriksaan klinis lanjutan atau uji genotipe konfirmatori.")
-
-            st.markdown(f"""
-            <div style="background:{_bg};border:1px solid {_bd};border-radius:10px;
-                        padding:0.9rem 1.5rem;margin-top:0.75rem;
-                        display:flex;align-items:flex-start;gap:1rem">
-                <div style="font-size:1.5rem;margin-top:0.05rem">{_icon}</div>
-                <div>
-                    <div style="font-size:0.68rem;font-weight:700;letter-spacing:0.1em;
-                                text-transform:uppercase;color:{_c};margin-bottom:0.25rem;
-                                font-family:'IBM Plex Mono',monospace">
-                        Kesimpulan Kedua Model &nbsp;·&nbsp; {_status}
+            if not reg_res.get("is_valid", True):
+                # ✅ FIX: Bi-LSTM gagal menghasilkan angka valid (NaN/Inf) — jangan
+                # dipaksa dibandingkan ke XGBoost. "nan >= x" selalu False di Python,
+                # yang tanpa guard ini akan keliru terbaca sebagai "konsisten sensitif".
+                st.markdown("""
+                <div style="background:rgba(113,128,150,0.08);border:1px solid rgba(113,128,150,0.3);border-radius:10px;
+                            padding:0.9rem 1.5rem;margin-top:0.75rem;
+                            display:flex;align-items:flex-start;gap:1rem">
+                    <div style="font-size:1.5rem;margin-top:0.05rem">⚪</div>
+                    <div>
+                        <div style="font-size:0.68rem;font-weight:700;letter-spacing:0.1em;
+                                    text-transform:uppercase;color:#718096;margin-bottom:0.25rem;
+                                    font-family:'IBM Plex Mono',monospace">
+                            Kesimpulan Kedua Model &nbsp;·&nbsp; TIDAK DAPAT DIBANDINGKAN
+                        </div>
+                        <div style="font-size:0.82rem;color:var(--text-secondary);line-height:1.5">
+                            Bi-LSTM tidak menghasilkan prediksi numerik yang valid untuk input ini, sehingga evaluasi kongruensi dilewati. <strong>Gunakan hasil XGBoost sebagai dasar keputusan untuk kasus ini.</strong>
+                        </div>
                     </div>
-                    <div style="font-size:0.82rem;color:var(--text-secondary);line-height:1.5">{_text}</div>
                 </div>
-            </div>
-            """, unsafe_allow_html=True)
+                """, unsafe_allow_html=True)
+            else:
+                xgb_resistant   = class_res["diagnosis"] == "RESISTEN"
+                bilstm_resistant = reg_res["fold_change"] >= reg_res["clinical_cutoff"]
+
+                if xgb_resistant == bilstm_resistant:
+                    _status = "KONSISTEN"
+                    if xgb_resistant:
+                        _c, _bg, _bd = "#C0392B", "rgba(192,57,43,0.07)", "rgba(192,57,43,0.28)"
+                        _icon = "🔴"
+                        _text = ("XGBoost dan Bi-LSTM <strong>sama-sama mendeteksi resistensi</strong>. "
+                                 "Pertimbangkan evaluasi penggantian regimen ARV bersama klinisi.")
+                    else:
+                        _c, _bg, _bd = "#1A7A4A", "rgba(26,122,74,0.07)", "rgba(26,122,74,0.28)"
+                        _icon = "🟢"
+                        _text = ("XGBoost dan Bi-LSTM <strong>sama-sama menunjukkan virus masih sensitif</strong>. "
+                                 "Terapi ARV yang berjalan saat ini dinilai masih efektif.")
+                else:
+                    _status = "TIDAK KONSISTEN"
+                    _c, _bg, _bd = "#B7770D", "rgba(183,119,13,0.07)", "rgba(183,119,13,0.35)"
+                    _icon = "⚠️"
+                    _text = ("Hasil XGBoost dan Bi-LSTM <strong>tidak saling mendukung</strong>. "
+                             "Disarankan pemeriksaan klinis lanjutan atau uji genotipe konfirmatori.")
+
+                st.markdown(f"""
+                <div style="background:{_bg};border:1px solid {_bd};border-radius:10px;
+                            padding:0.9rem 1.5rem;margin-top:0.75rem;
+                            display:flex;align-items:flex-start;gap:1rem">
+                    <div style="font-size:1.5rem;margin-top:0.05rem">{_icon}</div>
+                    <div>
+                        <div style="font-size:0.68rem;font-weight:700;letter-spacing:0.1em;
+                                    text-transform:uppercase;color:{_c};margin-bottom:0.25rem;
+                                    font-family:'IBM Plex Mono',monospace">
+                            Kesimpulan Kedua Model &nbsp;·&nbsp; {_status}
+                        </div>
+                        <div style="font-size:0.82rem;color:var(--text-secondary);line-height:1.5">{_text}</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
         if show_gauge or reg_res is not None:
             st.markdown("---")
