@@ -1368,7 +1368,6 @@ with tab_history:
                       f"{sum(h['fold_change'] for h in st.session_state.analysis_history) / n_total:.2f}×"
                       if n_total else "—")
 
-
 # ---------------------------------------------------------------------------
 # TAB 3: INFORMASI SISTEM
 # ---------------------------------------------------------------------------
